@@ -47,8 +47,15 @@ struct _sampgdk_hook_jmp {
 
 #pragma pack(pop)
 
+// To prevent SELinux from triggering an "execheap" AVC denial, the trampoline must be allocated in a separate memory region with mmap
+// Windows does not need special memory handling
 struct _sampgdk_hook {
+#if SAMPGDK_WINDOWS
   uint8_t trampoline[_SAMPGDK_HOOK_TRAMPOLINE_SIZE];
+#else
+  uint8_t *trampoline;
+  size_t trampoline_size;
+#endif
 };
 
 #if SAMPGDK_WINDOWS
@@ -65,13 +72,30 @@ static void *_sampgdk_hook_unprotect(void *address, size_t size) {
 
 #else /* SAMPGDK_WINDOWS */
 
+// The "unprotect" function name is misleading, but was kept here to make the code more consistent with Windows memory handling.
+// This function changes the memory regions permissions to read/write (without execute)
 static void *_sampgdk_hook_unprotect(void *address, size_t size) {
   long pagesize;
 
   pagesize = sysconf(_SC_PAGESIZE);
   address = (void *)((long)address & ~(pagesize - 1));
 
-  if (mprotect(address, size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+  if (mprotect(address, size, PROT_READ | PROT_WRITE) != 0) {
+    return NULL;
+  }
+
+  return address;
+}
+
+// This function changes the memory region's permissions to read/execute (without write)
+// SELinux does not like memory region's that are both writable and executable at the same time, so we just remove the write permission for that memory region
+static void *_sampgdk_hook_protect(void *address, size_t size) {
+  long pagesize;
+
+  pagesize = sysconf(_SC_PAGESIZE);
+  address = (void *)((long)address & ~(pagesize - 1));
+
+  if (mprotect(address, size, PROT_READ | PROT_EXEC) != 0) {
     return NULL;
   }
 
@@ -79,6 +103,7 @@ static void *_sampgdk_hook_unprotect(void *address, size_t size) {
 }
 
 #endif /* !SAMPGDK_WINDOWS */
+
 
 static size_t _sampgdk_hook_disasm(uint8_t *code, int *reloc) {
   enum flags {
@@ -209,14 +234,43 @@ static void _sampgdk_hook_write_jmp(void *src, void *dst, int32_t offset) {
 sampgdk_hook_t sampgdk_hook_new(void *src, void *dst) {
   struct _sampgdk_hook *hook;
   size_t orig_size = 0;
-  size_t insn_len;
+  size_t insn_len = 0;
 
   if ((hook = (sampgdk_hook_t)malloc(sizeof(*hook))) == NULL) {
     return NULL;
   }
 
+#if SAMPGDK_WINDOWS
+
+  // In Windows, we can simply allocate the trampoline in heap memory, no special memory handling required
   _sampgdk_hook_unprotect(src, _SAMPGDK_HOOK_JMP_SIZE);
-  _sampgdk_hook_unprotect(hook->trampoline, _SAMPGDK_HOOK_TRAMPOLINE_SIZE);
+  _sampgdk_hook_unprotect(hook->trampoline,
+                          _SAMPGDK_HOOK_TRAMPOLINE_SIZE);
+
+#else
+
+  // On Linux, the trampoline needs to be allocated in a separate memory region
+  // We can then control the memory region's permissions properly
+  long pagesize = sysconf(_SC_PAGESIZE);
+
+  hook->trampoline_size = (size_t)pagesize;
+  hook->trampoline = mmap(
+    NULL,
+    hook->trampoline_size,
+    PROT_READ | PROT_WRITE,
+    MAP_PRIVATE | MAP_ANONYMOUS,
+    -1,
+    0
+  );
+
+  if (hook->trampoline == MAP_FAILED) {
+    free(hook);
+    return NULL;
+  }
+
+  _sampgdk_hook_unprotect(src, _SAMPGDK_HOOK_JMP_SIZE);
+
+#endif
 
   /* We can't just jump to src + 5 as we could end up in the middle of
    * some instruction. So we need to determine the instruction length.
@@ -250,10 +304,22 @@ sampgdk_hook_t sampgdk_hook_new(void *src, void *dst) {
     _sampgdk_hook_write_jmp(hook->trampoline, src, 0);
   }
 
+#if !SAMPGDK_WINDOWS
+  // On Linux we are using a separate memory region allocated by mmap for the trampoline
+  // To prevent SELinux from triggering an "execheap" AVC denial, we need to change the permissions for the trampoline and "src" memory regions to read/execute only
+  _sampgdk_hook_protect(hook->trampoline, hook->trampoline_size);
+  _sampgdk_hook_protect(src, _SAMPGDK_HOOK_JMP_SIZE);
+#endif
+
   return hook;
 }
 
 void sampgdk_hook_free(sampgdk_hook_t hook) {
+#if !SAMPGDK_WINDOWS
+  // On Linux we need to release the trampoline memory region that we previously allocated using mmap
+  munmap(hook->trampoline, hook->trampoline_size);
+#endif
+
   free(hook);
 }
 
