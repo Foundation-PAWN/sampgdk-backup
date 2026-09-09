@@ -5,6 +5,10 @@ set -e
 [[ -z "$CONFIG" ]] \
 && config=Release \
 || config="$CONFIG"
+# Available version: any
+[[ -z "$VERSION" ]] \
+&& version=4.6.3 \
+|| version="$VERSION"
 # Available container runtimes: [docker], podman, other 
 [[ -z "$CONTAINER_RUNTIME" ]] \
 && container_runtime=docker \
@@ -42,4 +46,5 @@ USER_GID="$(id -g)"
     -w /code \
     -v "$SCRIPT_DIR/..:/code${volume_suffix}" \
     -e "CONFIG=${config}" \
+    -e "VERSION=${version}" \
     "${buildname}/build:ubuntu-20.04"
